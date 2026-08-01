@@ -8,6 +8,14 @@ from youtube_transcript_api import YouTubeTranscriptApi
 app = Flask(__name__)
 
 
+@app.after_request
+def allow_trace_note_origin(response):
+    if request.headers.get("Origin") == "https://trace-note-youtube-ai.hif790.chatgpt.site":
+        response.headers["Access-Control-Allow-Origin"] = "https://trace-note-youtube-ai.hif790.chatgpt.site"
+    response.headers["Vary"] = "Origin"
+    return response
+
+
 def video_id(value: str) -> str | None:
     value = (value or "").strip()
     if re.fullmatch(r"[\w-]{11}", value):
@@ -77,4 +85,4 @@ def transcripts():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "10000")))
