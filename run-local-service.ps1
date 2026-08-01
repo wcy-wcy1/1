@@ -8,5 +8,5 @@ if (-not (Test-Path $venvPath)) {
 
 & (Join-Path $venvPath "Scripts\python.exe") -m pip install --quiet -r (Join-Path $serviceRoot "requirements.txt")
 $env:HOST = "127.0.0.1"
-$env:PORT = "10000"
+$env:PORT = "8765"
 & (Join-Path $venvPath "Scripts\python.exe") (Join-Path $serviceRoot "app.py")
