@@ -53,13 +53,15 @@ def transcripts():
         if not available:
             return jsonify(error="该视频没有可用字幕。"), 422
 
+        # Prefer creator-provided transcript over automatically generated captions.
+        manual = [item for item in available if not item.is_generated]
         selected = None
         if preferred:
-            try:
-                selected = transcript_list.find_transcript([preferred])
-            except Exception:
-                selected = None
-        selected = selected or available[0]
+            for item in manual + available:
+                if item.language_code == preferred:
+                    selected = item
+                    break
+        selected = selected or (manual or available)[0]
         fetched = selected.fetch()
         segments = [
             {"start": round(item.start, 2), "duration": round(item.duration, 2), "text": item.text.replace("\n", " ").strip()}
