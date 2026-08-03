@@ -1,10 +1,10 @@
-$ErrorActionPreference = "Stop"
-$serviceRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = Join-Path $serviceRoot ".venv\Scripts\python.exe"
+$ErrorActionPreference = 'Stop'
+$python = Join-Path -Path $PSScriptRoot -ChildPath '.venv\Scripts\python.exe'
+$requirements = Join-Path -Path $PSScriptRoot -ChildPath 'requirements-deep.txt'
 
-if (-not (Test-Path $python)) {
-  throw "请先运行 run-local-service.ps1 一次，以创建本地运行环境。"
+if (-not (Test-Path -LiteralPath $python)) {
+  throw '请先运行本地服务一次，以创建本地运行环境。'
 }
 
-& $python -m pip install -r (Join-Path $serviceRoot "requirements-deep.txt")
-Write-Host "深度模式组件已安装。重启本地服务后即可选择深度模式。" -ForegroundColor Green
+& $python -m pip install -r $requirements
+Write-Host '深度模式组件已安装。重启本地服务后即可选择深度模式。' -ForegroundColor Green
