@@ -87,7 +87,34 @@ def transcribe_with_whisper(source_url: str) -> tuple[list[dict], str]:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def extract_keyframes(source_url: str, timestamps: list[float]) -> list[dict]:
+def _parse_scene_timestamps(stderr_text: str) -> list[float]:
+    pattern = re.compile(r"pts_time:\s*([\d.]+)")
+    return [float(match.group(1)) for line in stderr_text.splitlines() if "showinfo" in line for match in [pattern.search(line)] if match]
+
+
+def _evenly_spaced(values: list[tuple[Path, float]], limit: int) -> list[tuple[Path, float]]:
+    if len(values) <= limit:
+        return values
+    if limit == 1:
+        return [values[len(values) // 2]]
+    indexes = [round(index * (len(values) - 1) / (limit - 1)) for index in range(limit)]
+    return [values[index] for index in dict.fromkeys(indexes)]
+
+
+def _extract_at_timestamps(ffmpeg: str, media_file: Path, workdir: Path, timestamps: list[float]) -> list[tuple[Path, float]]:
+    extracted = []
+    for index, timestamp in enumerate(timestamps):
+        output = workdir / f"fallback-{index:02d}.jpg"
+        completed = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(media_file), "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4", "-y", str(output)],
+            capture_output=True, text=True, timeout=90,
+        )
+        if completed.returncode == 0 and output.exists():
+            extracted.append((output, timestamp))
+    return extracted
+
+
+def extract_keyframes(source_url: str, max_frames: int = 8, threshold: float = 0.32, min_gap: float = 4.0) -> tuple[list[dict], str]:
     status = deep_mode_status()
     if not status["available"]:
         raise RuntimeError("关键帧模式尚未安装：" + "、".join(status["missing"]))
@@ -97,21 +124,44 @@ def extract_keyframes(source_url: str, timestamps: list[float]) -> list[dict]:
     try:
         options = {"format": "bestvideo[height<=480]/best[height<=480]/worst", "outtmpl": str(workdir / "video.%(ext)s"), "noplaylist": True, "quiet": True, "no_warnings": True, "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe()}
         with yt_dlp.YoutubeDL(options) as downloader:
-            downloader.extract_info(source_url, download=True)
+            info = downloader.extract_info(source_url, download=True)
         media_files = [path for path in workdir.iterdir() if path.is_file() and path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}]
         if not media_files:
             raise RuntimeError("未能获取可提取画面的媒体文件。")
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        frames = []
-        for index, timestamp in enumerate(timestamps):
-            output = workdir / f"frame-{index}.jpg"
-            completed = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(media_files[0]), "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4", "-y", str(output)], capture_output=True, text=True, timeout=90)
-            if completed.returncode == 0 and output.exists():
-                encoded = base64.b64encode(output.read_bytes()).decode("ascii")
-                frames.append({"time": round(timestamp, 2), "image": "data:image/jpeg;base64," + encoded})
-        if not frames:
+        media_file = media_files[0]
+        scene_pattern = str(workdir / "scene-%04d.jpg")
+        completed = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "info", "-i", str(media_file), "-vf", f"select='gt(scene,{threshold})',showinfo,scale=640:-2", "-fps_mode", "vfr", "-q:v", "4", "-y", scene_pattern],
+            capture_output=True, text=True, timeout=300,
+        )
+        scene_files = sorted(workdir.glob("scene-*.jpg"))
+        scene_times = _parse_scene_timestamps(completed.stderr)
+        candidates = list(zip(scene_files, scene_times[:len(scene_files)]))
+        spaced = []
+        for candidate in candidates:
+            if not spaced or candidate[1] - spaced[-1][1] >= min_gap:
+                spaced.append(candidate)
+        strategy = "scene"
+        if len(spaced) < min(3, max_frames):
+            strategy = "interval"
+            duration = float(info.get("duration") or 0)
+            if duration <= 0:
+                duration = max((item[1] for item in candidates), default=0)
+            if duration <= 0:
+                raise RuntimeError("无法读取视频时长，不能生成关键画面。")
+            count = min(max_frames, max(3, round(duration / 90)))
+            timestamps = [(index + 0.5) * duration / count for index in range(count)]
+            selected = _extract_at_timestamps(ffmpeg, media_file, workdir, timestamps)
+        else:
+            selected = _evenly_spaced(spaced, max_frames)
+        if not selected:
             raise RuntimeError("视频已下载，但没有成功提取关键画面。")
-        return frames
+        frames = []
+        for frame_path, timestamp in selected:
+            encoded = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+            frames.append({"time": round(timestamp, 2), "image": "data:image/jpeg;base64," + encoded})
+        return frames, strategy
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -131,16 +181,13 @@ def keyframes():
     identifier = video_id(request.args.get("url", ""))
     if not identifier:
         return jsonify(error="请输入有效的 YouTube 视频链接。"), 400
-    raw_times = request.args.get("times", "").split(",")
     try:
-        timestamps = sorted({max(0.0, float(value)) for value in raw_times if value.strip()})[:6]
+        max_frames = min(12, max(3, int(request.args.get("max_frames", "8"))))
     except ValueError:
-        return jsonify(error="关键帧时间点格式不正确。"), 400
-    if not timestamps:
-        return jsonify(error="请至少提供一个关键帧时间点。"), 400
+        return jsonify(error="关键帧数量格式不正确。"), 400
     try:
-        frames = extract_keyframes(request.args.get("url", ""), timestamps)
-        return jsonify(video={"id": identifier}, count=len(frames), frames=frames)
+        frames, strategy = extract_keyframes(request.args.get("url", ""), max_frames=max_frames)
+        return jsonify(video={"id": identifier}, strategy=strategy, count=len(frames), frames=frames)
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 422
     except Exception as exc:
